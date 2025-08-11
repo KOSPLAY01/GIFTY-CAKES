@@ -85,6 +85,12 @@ app.get('/', (req, res) => {
   res.send('Welcome to GIFTY CAKES API');
 });
 
+app.get('/ping', (req, res) => {
+  console.log(`Ping from cron-job.org at ${new Date().toISOString()}`);
+  res.send('Pong');
+});
+
+
 
 // User Management 
 

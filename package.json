@@ -14,7 +14,7 @@
   "dependencies": {
     "@neondatabase/serverless": "^1.0.1",
     "@supabase/supabase-js": "^2.50.0",
-    "axios": "^1.10.0",
+    "axios": "^1.11.0",
     "bcrypt": "^6.0.0",
     "cloudinary": "^2.7.0",
     "cors": "^2.8.5",
@@ -23,6 +23,7 @@
     "fs": "^0.0.1-security",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.1",
+    "node-cron": "^4.2.1",
     "node-fetch": "^3.3.2",
     "nodemailer": "^7.0.3",
     "stripe": "^18.2.1"

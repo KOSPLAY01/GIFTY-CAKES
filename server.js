@@ -87,8 +87,9 @@ app.get('/', (req, res) => {
 
 app.get('/ping', (req, res) => {
   console.log(`Ping from cron-job.org at ${new Date().toISOString()}`);
-  res.send('Pong');
+  res.status(200)
 });
+
 
 
 

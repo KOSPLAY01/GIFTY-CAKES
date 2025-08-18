@@ -883,85 +883,82 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
 
 // PAYMENT WEBHOOK (Paystack)
 app.post('/payments/webhook', async (req, res) => {
-  console.log('Paystack webhook hit at', new Date().toISOString());
-
   try {
     const signature = req.headers['x-paystack-signature'];
     if (!signature) return res.status(400).send('Missing signature');
 
+    // raw buffer
+    const rawBody = req.body;
+
+    // compute hash
     const hash = crypto
-      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
-      .update(req.body)
+      .createHmac('sha512', process.env.PAYSTACK_SECRET) // use the same secret you used in /initiate
+      .update(rawBody)
       .digest('hex');
 
-    if (hash !== signature) return res.status(401).send('Invalid signature');
+    if (hash !== signature) {
+      console.error('❌ Invalid signature');
+      return res.status(401).send('Invalid signature');
+    }
 
-    const event = JSON.parse(req.body.toString());
-    const data = event.data;
-    if (!data) return res.status(400).send('No data');
+    // parse json
+    const event = JSON.parse(rawBody.toString());
+    const { event: eventType, data } = event;
 
-    const email = data.customer?.email;
-    const metadata = data.metadata;
-    const amount = data.amount ? data.amount / 100 : 0;
+    console.log('✅ Verified webhook:', eventType);
 
-    if (!metadata?.user_id || !email) return res.status(400).send('Missing user or email');
+    if (eventType === 'charge.success') {
+      const ref = data.reference;
+      const metadata = data.metadata;
+      const user_id = metadata.user_id;
 
-    const ref = data.reference;
-    const user_id = metadata.user_id;
-
-    if (event.event === 'charge.success') {
-      const existing = await sql`SELECT * FROM orders WHERE payment_intent_id = ${ref}`;
-      if (existing.length > 0) return res.sendStatus(200);
-
-      const cart = await getOrCreateCart(user_id);
-      const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
-      const subtotal = items.reduce((sum, i) => sum + Number(i.price), 0);
-      const total = subtotal + Number(metadata.delivery_fee);
-
-      const insertedOrder = await sql`
-        INSERT INTO orders (user_id, total, delivery_fee, delivery_date, delivery_time, payment_method, payment_intent_id, status)
-        VALUES (${user_id}, ${total}, ${metadata.delivery_fee}, ${metadata.delivery_date}, ${metadata.delivery_time}, 'paystack', ${ref}, 'paid')
-        RETURNING *
+      // check if order already exists
+      const existing = await sql`
+        SELECT * FROM orders WHERE payment_intent_id = ${ref}
       `;
-      const order = insertedOrder[0];
+      if (existing.length > 0) {
+        console.log('Order already exists for reference:', ref);
+        return res.sendStatus(200);
+      }
 
-      await sql`
-        INSERT INTO shipping_addresses (user_id, order_id, email, first_name, last_name, phone, address, city, delivery_date, delivery_time)
-        VALUES (${user_id}, ${order.id}, ${email}, ${metadata.first_name}, ${metadata.last_name}, ${metadata.phone}, ${metadata.address}, ${metadata.city}, ${metadata.delivery_date}, ${metadata.delivery_time})
+      // 1. create order
+      const [order] = await sql`
+        INSERT INTO orders (user_id, total, status, payment_intent_id)
+        VALUES (${user_id}, ${data.amount / 100}, 'pending', ${ref})
+        RETURNING id
       `;
 
-      for (const item of items) {
+      const orderId = order.id;
+
+      // 2. shipping address
+      const shipping = metadata.shipping;
+      if (shipping) {
         await sql`
-          INSERT INTO order_items (order_id, product_id, quantity, price)
-          VALUES (${order.id}, ${item.product_id}, ${item.quantity}, ${item.price})
+          INSERT INTO shipping_addresses (order_id, name, address, city, state, postal_code, country)
+          VALUES (${orderId}, ${shipping.name}, ${shipping.address}, ${shipping.city},
+                  ${shipping.state}, ${shipping.postal_code}, ${shipping.country})
         `;
       }
 
-      await sql`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
-      await sql`UPDATE carts SET grand_total = 0 WHERE id = ${cart.id}`;
+      // 3. move cart items → order_items
+      const cartItems = await sql`SELECT * FROM cart_items WHERE user_id = ${user_id}`;
+      for (const item of cartItems) {
+        await sql`
+          INSERT INTO order_items (order_id, product_id, quantity)
+          VALUES (${orderId}, ${item.product_id}, ${item.quantity})
+        `;
+      }
 
-      await sql`
-        INSERT INTO payment_references 
-        (user_id, order_id, reference, amount, channel, currency, status, paid_at)
-        VALUES 
-        (${user_id}, ${order.id}, ${ref}, ${amount}, ${data.channel}, ${data.currency}, ${data.status}, ${data.paid_at})
-      `;
+      // 4. clear cart
+      await sql`DELETE FROM cart_items WHERE user_id = ${user_id}`;
+
+      console.log(`🎉 Order ${orderId} created for user ${user_id}`);
     }
 
-    if (event.event === 'charge.failed') {
-      await sql`UPDATE orders SET status = 'failed' WHERE payment_intent_id = ${ref}`;
-      await sql`
-        INSERT INTO payment_references 
-        (user_id, order_id, reference, amount, channel, currency, status, paid_at)
-        VALUES 
-        (${user_id}, null, ${ref}, ${amount}, ${data.channel}, ${data.currency}, ${data.status}, ${data.paid_at})
-      `;
-    }
-
-    res.sendStatus(200);
+    res.sendStatus(200); // Always ack quickly
   } catch (err) {
     console.error('Webhook error:', err);
-    res.status(500).send('Webhook processing failed');
+    res.sendStatus(500);
   }
 });
 

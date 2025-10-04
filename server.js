@@ -882,22 +882,17 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
   const { email, delivery_date, delivery_time, first_name, last_name, phone, address, city } = req.body;
 
   try {
-    // 🔎 Check if Paystack secret is available
     if (!process.env.PAYSTACK_SECRET) {
-      return res.status(500).json({
-        error: "PAYSTACK_SECRET is not set in environment variables",
-      });
+      return res.status(500).json({ error: "PAYSTACK_SECRET is not set in environment variables" });
     }
-
-    console.log("DEBUG: Paystack key prefix in use:", process.env.PAYSTACK_SECRET.slice(0, 7));
 
     // get user cart
     const cart = await getOrCreateCart(req.user.id);
     const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
     if (!items.length) return res.status(400).json({ error: 'Cart is empty' });
 
-    // calculate totals
-    const subtotal = items.reduce((sum, i) => sum + Number(i.price), 0);
+    // ✅ FIX subtotal: price * quantity
+    const subtotal = items.reduce((sum, i) => sum + (Number(i.price) * i.quantity), 0);
     const delivery_fee = 1000; // flat fee
     const total = subtotal + delivery_fee;
 
@@ -929,7 +924,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
       }
     );
 
-    res.json(response.data.data); // contains authorization_url, reference
+    res.json(response.data.data);
   } catch (err) {
     console.error("Paystack initiation error:", err.response?.data || err.message);
     res.status(500).json({
@@ -940,9 +935,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
 });
 
 
-
-
-// ✅ FIXED PAYSTACK WEBHOOK
+// ✅ PAYSTACK WEBHOOK
 app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const signature = req.headers['x-paystack-signature'];
@@ -969,21 +962,23 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
       const metadata = data.metadata;
       const user_id = metadata.user_id;
 
-     
+      // avoid duplicate order
       const existing = await sql`SELECT * FROM orders WHERE payment_intent_id = ${ref}`;
       if (existing.length) {
         console.log('Order already exists for reference:', ref);
         return res.sendStatus(200);
       }
 
-      
+      // get cart again
       const cart = await getOrCreateCart(user_id);
       const cartItems = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
-      const subtotal = cartItems.reduce((sum, i) => sum + Number(i.price), 0);
+
+      // ✅ FIX subtotal: price * quantity
+      const subtotal = cartItems.reduce((sum, i) => sum + (Number(i.price) * i.quantity), 0);
       const delivery_fee = metadata.delivery_fee || 0;
       const total = subtotal + delivery_fee;
 
-      
+      // insert order
       const [order] = await sql`
         INSERT INTO orders (user_id, total, delivery_fee, delivery_date, delivery_time, payment_method, payment_intent_id, status)
         VALUES (
@@ -999,7 +994,7 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
         RETURNING id
       `;
 
-      
+      // insert order items
       for (const item of cartItems) {
         await sql`
           INSERT INTO order_items (order_id, product_id, quantity, price, custom_description, custom_message)
@@ -1014,10 +1009,10 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
         `;
       }
 
-      // ✅ Clear cart
+      // clear cart
       await sql`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
 
-      console.log(`🎉 Order ${order.id} created for user ${user_id}`);
+      console.log(`🎉 Order ${order.id} created for user ${user_id} with total ₦${total}`);
     }
 
     res.sendStatus(200);

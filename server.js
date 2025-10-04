@@ -882,6 +882,15 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
   const { email, delivery_date, delivery_time, first_name, last_name, phone, address, city } = req.body;
 
   try {
+    // 🔎 Check if Paystack secret is available
+    if (!process.env.PAYSTACK_SECRET) {
+      return res.status(500).json({
+        error: "PAYSTACK_SECRET is not set in environment variables",
+      });
+    }
+
+    console.log("DEBUG: Paystack key prefix in use:", process.env.PAYSTACK_SECRET.slice(0, 7));
+
     // get user cart
     const cart = await getOrCreateCart(req.user.id);
     const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
@@ -909,7 +918,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
           first_name,
           last_name,
           city,
-          cart: items // include cart items for reference
+          cart: items
         }
       },
       {
@@ -929,6 +938,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
     });
   }
 });
+
 
 
 

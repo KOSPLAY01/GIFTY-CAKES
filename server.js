@@ -974,10 +974,16 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
       const cart = await getOrCreateCart(user_id);
       const cartItems = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
 
-      // ✅ FIX subtotal: price * quantity
+      // ✅ Subtotal: price * quantity
       const subtotal = cartItems.reduce((sum, i) => sum + (Number(i.price) * i.quantity), 0);
       const delivery_fee = metadata.delivery_fee || 0;
-      const total = subtotal + delivery_fee;
+      const calculatedTotal = subtotal + delivery_fee;
+
+      // ✅ Use Paystack’s verified amount (convert from kobo to naira)
+      const paidAmount = data.amount / 100;
+
+      // ✅ Prefer Paystack amount, but fallback to calculated
+      const total = paidAmount || calculatedTotal;
 
       // insert order
       const [order] = await sql`
@@ -995,7 +1001,7 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
         RETURNING id
       `;
 
-      // insert order items
+      // ✅ insert order items (store total per item)
       for (const item of cartItems) {
         await sql`
           INSERT INTO order_items (order_id, product_id, quantity, price, custom_description, custom_message)
@@ -1003,7 +1009,7 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
             ${order.id},
             ${item.product_id},
             ${item.quantity},
-            ${item.price},
+            ${item.price * item.quantity}, -- ✅ total price per item
             ${item.custom_description || null},
             ${item.custom_message || null}
           )

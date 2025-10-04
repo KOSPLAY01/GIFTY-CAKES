@@ -401,7 +401,7 @@ app.post("/checkout/confirm", authenticateToken, async (req, res) => {
 
       const insertedOrder = await sql`
         INSERT INTO orders (user_id, total, delivery_fee, delivery_date, delivery_time, payment_method, status)
-        VALUES (${req.user.id}, ${total}, ${delivery_fee}, ${delivery_date}, ${delivery_time}, ${payment_method}, 'pending')
+        VALUES (${req.user.id}, ${total}, ${delivery_fee}, ${delivery_date}, ${delivery_time}, ${payment_method}, 'pay on delivery')
         RETURNING *
       `;
       const order = insertedOrder[0];

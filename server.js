@@ -447,88 +447,85 @@ app.post("/checkout/confirm", authenticateToken, async (req, res) => {
 
 // ORDER MANAGEMENT
 
+// --- GET USER ORDERS ---
 app.get("/orders", authenticateToken, async (req, res) => {
   try {
     const { filter, page = 1, limit = 20 } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
     const userId = parseInt(req.user.user_id || req.user.id, 10);
-    if (!userId) {
-      return res.status(401).json({ error: "User not found in token" });
-    }
+    if (!userId) return res.status(401).json({ error: "User not found in token" });
 
-    // Count total
-    let totalArr;
-    if (filter && ["pending", "paid", "completed"].includes(filter)) {
-      totalArr = await sql`
-        SELECT COUNT(*)::int AS count
-        FROM orders
-        WHERE user_id = ${userId} AND status = ${filter}
-      `;
-    } else {
-      totalArr = await sql`
-        SELECT COUNT(*)::int AS count
-        FROM orders
-        WHERE user_id = ${userId}
-      `;
-    }
-    const total = totalArr[0]?.count || 0;
+    // --- Count total orders ---
+    const countQuery = `
+      SELECT COUNT(*)::int AS count
+      FROM orders
+      WHERE user_id = $1
+      ${filter && ["pending", "paid", "completed"].includes(filter) ? "AND status = $2" : ""}
+    `;
+    const countParams = filter && ["pending", "paid", "completed"].includes(filter)
+      ? [userId, filter]
+      : [userId];
+    const totalResult = await sql.query(countQuery, countParams);
+    const total = totalResult[0]?.count || 0;
 
-    // Get paginated orders
-    let ordersResult;
-    if (filter && ["pending", "paid", "completed"].includes(filter)) {
-      ordersResult = await sql`
-        SELECT *
-        FROM orders
-        WHERE user_id = ${userId} AND status = ${filter}
-        ORDER BY created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-    } else {
-      ordersResult = await sql`
-        SELECT *
-        FROM orders
-        WHERE user_id = ${userId}
-        ORDER BY created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-    }
+    // --- Orders + Shipping ---
+    const ordersQuery = `
+      SELECT 
+        o.*,
+        json_build_object(
+          'email', s.email,
+          'first_name', s.first_name,
+          'last_name', s.last_name,
+          'phone', s.phone,
+          'address', s.address,
+          'city', s.city,
+          'delivery_date', s.delivery_date,
+          'delivery_time', s.delivery_time
+        ) AS shipping
+      FROM orders o
+      LEFT JOIN shipping_addresses s ON o.id = s.order_id
+      WHERE o.user_id = $1
+      ${filter && ["pending", "paid", "completed"].includes(filter) ? "AND o.status = $2" : ""}
+      ORDER BY o.created_at DESC
+      LIMIT $${filter ? 3 : 2} OFFSET $${filter ? 4 : 3}
+    `;
+    const ordersParams = filter && ["pending", "paid", "completed"].includes(filter)
+      ? [userId, filter, limitNum, offset]
+      : [userId, limitNum, offset];
+    const ordersResult = await sql.query(ordersQuery, ordersParams);
 
-    const orders = ordersResult || [];
-
-    // Enrich with shipping + items
+    // --- Add order items to each ---
     const enrichedOrders = await Promise.all(
-      (orders || []).map(async (order) => {
-        const shipping = (
-          await sql`
-        SELECT * FROM shipping_addresses WHERE order_id = ${order.id}
-      `
-        )[0];
+      ordersResult.map(async (order) => {
         const items = await sql`
-        SELECT *, (
-          SELECT row_to_json(p)
-          FROM products p
-          WHERE p.id = order_items.product_id
-        ) as product
-        FROM order_items
-        WHERE order_id = ${order.id}
-      `;
-        return { ...order, shipping, items };
+          SELECT oi.*, (
+            SELECT row_to_json(p)
+            FROM products p
+            WHERE p.id = oi.product_id
+          ) AS product
+          FROM order_items oi
+          WHERE oi.order_id = ${order.id}
+        `;
+        return { ...order, items };
       })
     );
 
     res.json({
       orders: enrichedOrders,
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: pageNum,
+      limit: limitNum,
       total,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(total / limitNum),
     });
   } catch (err) {
-    console.error("Error fetching orders:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error fetching orders:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // GET ORDER BY ID
 app.get("/orders/:id", authenticateToken, async (req, res) => {

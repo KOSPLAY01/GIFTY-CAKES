@@ -416,49 +416,69 @@ app.post('/checkout/confirm', authenticateToken, async (req, res) => {
 
 // ORDER MANAGEMENT
 
-// GET ALL ORDERS
 app.get('/orders', authenticateToken, async (req, res) => {
   try {
     const { filter, page = 1, limit = 20 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    // ✅ Fallback: support both `id` and `user_id` in the JWT
-    const userId = req.user.user_id || req.user.id;
+    const userId = parseInt(req.user.user_id || req.user.id, 10);
     if (!userId) {
       return res.status(401).json({ error: "User not found in token" });
     }
 
-    let whereClause = 'WHERE user_id = $1';
-    let params = [userId];
-
-    if (filter && ['pending', 'paid', 'completed'].includes(filter)) {
-      whereClause += ' AND status = $2';
-      params.push(filter);
-    }
-
     // Count total
-    const countQuery = `SELECT COUNT(*)::int AS count FROM orders ${whereClause}`;
-    const totalArr = await sql.unsafe(countQuery, params);
+    let totalArr;
+    if (filter && ['pending', 'paid', 'completed'].includes(filter)) {
+      totalArr = await sql`
+        SELECT COUNT(*)::int AS count
+        FROM orders
+        WHERE user_id = ${userId} AND status = ${filter}
+      `;
+    } else {
+      totalArr = await sql`
+        SELECT COUNT(*)::int AS count
+        FROM orders
+        WHERE user_id = ${userId}
+      `;
+    }
     const total = totalArr[0]?.count || 0;
 
     // Get paginated orders
-    const ordersQuery = `SELECT * FROM orders ${whereClause} 
-                         ORDER BY created_at DESC 
-                         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    const ordersResult = await sql.unsafe(ordersQuery, [...params, limit, offset]);
-    const orders = Array.isArray(ordersResult) ? ordersResult : (ordersResult?.rows || []);
+    let ordersResult;
+    if (filter && ['pending', 'paid', 'completed'].includes(filter)) {
+      ordersResult = await sql`
+        SELECT *
+        FROM orders
+        WHERE user_id = ${userId} AND status = ${filter}
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    } else {
+      ordersResult = await sql`
+        SELECT *
+        FROM orders
+        WHERE user_id = ${userId}
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    }
+
+    const orders = ordersResult || [];
 
     // Enrich with shipping + items
     const enrichedOrders = await Promise.all((orders || []).map(async (order) => {
-      const shipping = (await sql`SELECT * FROM shipping_addresses WHERE order_id = ${order.id}`)[0];
+      const shipping = (await sql`
+        SELECT * FROM shipping_addresses WHERE order_id = ${order.id}
+      `)[0];
       const items = await sql`
         SELECT *, (
-          SELECT row_to_json(p) 
-          FROM products p 
+          SELECT row_to_json(p)
+          FROM products p
           WHERE p.id = order_items.product_id
-        ) as product 
-        FROM order_items 
-        WHERE order_id = ${order.id}`;
+        ) as product
+        FROM order_items
+        WHERE order_id = ${order.id}
+      `;
       return { ...order, shipping, items };
     }));
 
@@ -474,6 +494,7 @@ app.get('/orders', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 
 // GET ORDER BY ID

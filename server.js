@@ -903,7 +903,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
         email,
         amount: total * 100, // kobo
         currency: "NGN",
-        callback_url: `${process.env.FRONTEND_URL}/checkout/status`,
+        callback_url: `${process.env.FRONTEND_URL}/orders`,
         metadata: {
           user_id: req.user.id,
           delivery_fee,

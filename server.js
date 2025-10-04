@@ -877,34 +877,35 @@ app.delete('/cart/:id', authenticateToken, async (req, res) => {
 });
 
 // PAYMENT MANAGEMENT
-
 // PAYMENT INITIATION (Paystack)
 app.post('/payments/initiate', authenticateToken, async (req, res) => {
-  const { email } = req.body;
-  const cart = await getOrCreateCart(req.user.id);
-  const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
-  if (!items.length) return res.status(400).json({ error: 'Cart is empty' });
-
-  const subtotal = items.reduce((sum, i) => sum + Number(i.price), 0);
-  const delivery_fee = 1000; // Example: flat fee or calculated dynamically
-  const total = subtotal + delivery_fee;
-
   try {
+    const { email, delivery_date, delivery_time, address, phone, first_name, last_name, city } = req.body;
+
+    const cart = await getOrCreateCart(req.user.id);
+    const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
+    if (!items.length) return res.status(400).json({ error: 'Cart is empty' });
+
+    const subtotal = items.reduce((sum, i) => sum + Number(i.price), 0);
+    const delivery_fee = 1000; // Example flat fee (customize if needed)
+    const total = subtotal + delivery_fee;
+
     const response = await axios.post(
       'https://api.paystack.co/transaction/initialize',
       {
         email,
-        amount: total * 100, // kobo
+        amount: total * 100, // Paystack expects kobo
         metadata: {
           user_id: req.user.id,
           delivery_fee,
-          delivery_date: req.body.delivery_date,
-          delivery_time: req.body.delivery_time,
-          address: req.body.address,
-          phone: req.body.phone,
-          first_name: req.body.first_name,
-          last_name: req.body.last_name,
-          city: req.body.city
+          delivery_date,
+          delivery_time,
+          address,
+          phone,
+          first_name,
+          last_name,
+          city,
+          cart: items
         }
       },
       {
@@ -914,33 +915,32 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
         }
       }
     );
-    res.json(response.data.data); // contains authorization_url, reference
+
+    res.json(response.data.data); // contains authorization_url + reference
   } catch (err) {
+    console.error('Paystack Init Error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to initiate Paystack payment' });
   }
 });
 
-// PAYMENT WEBHOOK (Paystack)
-app.post('/payments/webhook', async (req, res) => {
+
+// RAW body parser required for signature check
+app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const signature = req.headers['x-paystack-signature'];
     if (!signature) return res.status(400).send('Missing signature');
 
-    // raw buffer
-    const rawBody = req.body;
-
-    // compute hash
+    const rawBody = req.body; // Buffer
     const hash = crypto
-      .createHmac('sha512', process.env.PAYSTACK_SECRET) // use the same secret you used in /initiate
+      .createHmac('sha512', process.env.PAYSTACK_SECRET)
       .update(rawBody)
       .digest('hex');
 
     if (hash !== signature) {
-      console.error('❌ Invalid signature');
+      console.error('❌ Invalid Paystack signature');
       return res.status(401).send('Invalid signature');
     }
 
-    // parse json
     const event = JSON.parse(rawBody.toString());
     const { event: eventType, data } = event;
 
@@ -951,52 +951,54 @@ app.post('/payments/webhook', async (req, res) => {
       const metadata = data.metadata;
       const user_id = metadata.user_id;
 
-      // check if order already exists
-      const existing = await sql`
-        SELECT * FROM orders WHERE payment_intent_id = ${ref}
-      `;
-      if (existing.length > 0) {
+      // Check if order already exists
+      const existing = await sql`SELECT * FROM orders WHERE payment_intent_id = ${ref}`;
+      if (existing.length) {
         console.log('Order already exists for reference:', ref);
         return res.sendStatus(200);
       }
 
-      // 1. create order
+      // Fetch cart
+      const cart = await getOrCreateCart(user_id);
+      const cartItems = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
+      const subtotal = cartItems.reduce((sum, i) => sum + Number(i.price), 0);
+      const delivery_fee = metadata.delivery_fee || 0;
+      const total = subtotal + delivery_fee;
+
+      // Insert order
       const [order] = await sql`
-        INSERT INTO orders (user_id, total, status, payment_intent_id)
-        VALUES (${user_id}, ${data.amount / 100}, 'pending', ${ref})
+        INSERT INTO orders (user_id, items, subtotal, delivery_fee, grand_total, status, payment_method, payment_intent_id, delivery_address)
+        VALUES (
+          ${user_id},
+          ${JSON.stringify(cartItems)},
+          ${subtotal},
+          ${delivery_fee},
+          ${total},
+          'paid',
+          'paystack',
+          ${ref},
+          ${metadata.address}
+        )
         RETURNING id
       `;
 
-      const orderId = order.id;
-
-      // 2. shipping address
-      const shipping = metadata.shipping;
-      if (shipping) {
-        await sql`
-          INSERT INTO shipping_addresses (order_id, name, address, city, state, postal_code, country)
-          VALUES (${orderId}, ${shipping.name}, ${shipping.address}, ${shipping.city},
-                  ${shipping.state}, ${shipping.postal_code}, ${shipping.country})
-        `;
-      }
-
-      // 3. move cart items → order_items
-      const cartItems = await sql`SELECT * FROM cart_items WHERE user_id = ${user_id}`;
+      // Move cart items → order_items
       for (const item of cartItems) {
         await sql`
           INSERT INTO order_items (order_id, product_id, quantity)
-          VALUES (${orderId}, ${item.product_id}, ${item.quantity})
+          VALUES (${order.id}, ${item.product_id}, ${item.quantity})
         `;
       }
 
-      // 4. clear cart
-      await sql`DELETE FROM cart_items WHERE user_id = ${user_id}`;
+      // Clear cart
+      await sql`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
 
-      console.log(`🎉 Order ${orderId} created for user ${user_id}`);
+      console.log(`🎉 Order ${order.id} created for user ${user_id}`);
     }
 
-    res.sendStatus(200); // Always ack quickly
+    res.sendStatus(200); // Always ack Paystack
   } catch (err) {
-    console.error('Webhook error:', err);
+    console.error('Webhook error:', err.message);
     res.sendStatus(500);
   }
 });

@@ -576,43 +576,53 @@ app.get("/admin/orders", authenticateToken, async (req, res) => {
     const limitNum = parseInt(limit);
     const offset = (pageNum - 1) * limitNum;
 
-    // Build dynamic queries depending on filter
-    let countQuery, countParams, ordersQuery, orderParams;
+    // Build dynamic query
+    let whereClause = "";
+    const params = [];
 
     if (filter && ["pending", "paid", "completed"].includes(filter)) {
-      // Filter by specific status
-      countQuery = `SELECT COUNT(*)::int AS count FROM orders WHERE status = $1`;
-      countParams = [filter];
-      ordersQuery = `
-        SELECT * FROM orders
-        WHERE status = $1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-      `;
-      orderParams = [filter, limitNum, offset];
-    } else {
-      // No filter → show all orders
-      countQuery = `SELECT COUNT(*)::int AS count FROM orders`;
-      countParams = [];
-      ordersQuery = `
-        SELECT * FROM orders
-        ORDER BY created_at DESC
-        LIMIT $1 OFFSET $2
-      `;
-      orderParams = [limitNum, offset];
+      whereClause = `WHERE o.status = $1`;
+      params.push(filter);
     }
 
-    // Run count + data queries
-    const countResult = await sql.query(countQuery, countParams);
+    // Count
+    const countQuery = `
+      SELECT COUNT(*)::int AS count
+      FROM orders o
+      ${whereClause}
+    `;
+    const countResult = await sql.query(countQuery, params);
     const total = countResult[0]?.count || 0;
 
-    const orderResults = await sql.query(ordersQuery, orderParams);
+    // Orders with JOINs
+    const ordersQuery = `
+      SELECT 
+        o.*,
+        json_build_object(
+          'email', s.email,
+          'first_name', s.first_name,
+          'last_name', s.last_name,
+          'phone', s.phone,
+          'address', s.address,
+          'city', s.city,
+          'delivery_date', s.delivery_date,
+          'delivery_time', s.delivery_time
+        ) AS shipping
+      FROM orders o
+      LEFT JOIN shipping_addresses s ON o.id = s.order_id
+      ${whereClause}
+      ORDER BY o.created_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
+    const orderResults = await sql.query(ordersQuery, [
+      ...params,
+      limitNum,
+      offset,
+    ]);
 
-    // Enrich each order with shipping + items
+    // Attach order items
     const enrichedOrders = await Promise.all(
       orderResults.map(async (order) => {
-        const shippingRes =
-          await sql`SELECT * FROM shipping_addresses WHERE order_id = ${order.id}`;
         const itemsRes = await sql`
           SELECT oi.*, (
             SELECT row_to_json(p)
@@ -624,7 +634,6 @@ app.get("/admin/orders", authenticateToken, async (req, res) => {
         `;
         return {
           ...order,
-          shipping: shippingRes[0] || null,
           items: itemsRes,
         };
       })
@@ -642,6 +651,7 @@ app.get("/admin/orders", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 
 // GET ALL PRODUCTS (Admin)
@@ -1055,73 +1065,109 @@ app.post(
 
       const event = JSON.parse(rawBody.toString());
       const { event: eventType, data } = event;
-
       console.log("✅ Verified webhook:", eventType);
 
-      if (eventType === "charge.success") {
+      if (eventType === "charge.success" && data.status === "success") {
         const ref = data.reference;
-        const metadata = data.metadata;
+        const metadata = data.metadata || {};
         const user_id = metadata.user_id;
 
         // avoid duplicate order
         const existing =
           await sql`SELECT * FROM orders WHERE payment_intent_id = ${ref}`;
         if (existing.length) {
-          console.log("Order already exists for reference:", ref);
+          console.log("⚠️ Order already exists for reference:", ref);
           return res.sendStatus(200);
         }
 
-        // get cart again
+        // get user cart
         const cart = await getOrCreateCart(user_id);
         const cartItems =
           await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
 
-        // ✅ Subtotal: price * quantity
+        // subtotal and delivery
         const subtotal = cartItems.reduce(
           (sum, i) => sum + Number(i.price) * i.quantity,
           0
         );
         const delivery_fee = metadata.delivery_fee || 0;
-        const calculatedTotal = subtotal + delivery_fee;
+        const total = (data.amount || subtotal + delivery_fee) / 100;
 
-        // ✅ Use Paystack’s verified amount (convert from kobo to naira)
-        const paidAmount = data.amount / 100;
-
-        // ✅ Prefer Paystack amount, but fallback to calculated
-        const total = paidAmount || calculatedTotal;
-
-        // insert order
+        // ✅ insert order
         const [order] = await sql`
-        INSERT INTO orders (user_id, total, delivery_fee, delivery_date, delivery_time, payment_method, payment_intent_id, status)
-        VALUES (
-          ${user_id},
-          ${total},
-          ${delivery_fee},
-          ${metadata.delivery_date},
-          ${metadata.delivery_time},
-          'paystack',
-          ${ref},
-          'paid'
-        )
-        RETURNING id
-      `;
-
-        // ✅ insert order items (store total per item)
-        for (const item of cartItems) {
-          await sql`
-          INSERT INTO order_items (order_id, product_id, quantity, price, custom_description, custom_message)
+          INSERT INTO orders (
+            user_id,
+            total,
+            delivery_fee,
+            delivery_date,
+            delivery_time,
+            payment_method,
+            payment_intent_id,
+            status
+          )
           VALUES (
+            ${user_id},
+            ${total},
+            ${delivery_fee},
+            ${metadata.delivery_date},
+            ${metadata.delivery_time},
+            'paystack',
+            ${ref},
+            'paid'
+          )
+          RETURNING id
+        `;
+
+        // ✅ insert shipping info
+        await sql`
+          INSERT INTO shipping_addresses (
+            user_id,
+            order_id,
+            email,
+            first_name,
+            last_name,
+            phone,
+            address,
+            city,
+            delivery_date,
+            delivery_time
+          ) VALUES (
+            ${metadata.user_id},
             ${order.id},
-            ${item.product_id},
-            ${item.quantity},
-            ${item.price * item.quantity}, -- ✅ total price per item
-            ${item.custom_description || null},
-            ${item.custom_message || null}
+            ${metadata.email},
+            ${metadata.first_name},
+            ${metadata.last_name},
+            ${metadata.phone},
+            ${metadata.address},
+            ${metadata.city},
+            ${metadata.delivery_date},
+            ${metadata.delivery_time}
           )
         `;
+
+        // ✅ insert order items
+        for (const item of cartItems) {
+          await sql`
+            INSERT INTO order_items (
+              order_id,
+              product_id,
+              quantity,
+              price,
+              custom_description,
+              custom_message
+            )
+            VALUES (
+              ${order.id},
+              ${item.product_id || null},
+              ${item.quantity},
+              ${item.price * item.quantity},
+              ${item.custom_description || null},
+              ${item.custom_message || null}
+            )
+          `;
         }
 
-        // clear cart
+        // ✅ clear cart
         await sql`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
 
         console.log(
@@ -1131,11 +1177,12 @@ app.post(
 
       res.sendStatus(200);
     } catch (err) {
-      console.error("Webhook error:", err.message);
+      console.error("❌ Webhook error:", err.message);
       res.sendStatus(500);
     }
   }
 );
+
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

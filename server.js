@@ -422,8 +422,14 @@ app.get('/orders', authenticateToken, async (req, res) => {
     const { filter, page = 1, limit = 20 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
+    // ✅ Fallback: support both `id` and `user_id` in the JWT
+    const userId = req.user.user_id || req.user.id;
+    if (!userId) {
+      return res.status(401).json({ error: "User not found in token" });
+    }
+
     let whereClause = 'WHERE user_id = $1';
-    let params = [req.user.id];
+    let params = [userId];
 
     if (filter && ['pending', 'paid', 'completed'].includes(filter)) {
       whereClause += ' AND status = $2';
@@ -431,18 +437,28 @@ app.get('/orders', authenticateToken, async (req, res) => {
     }
 
     // Count total
-    let countQuery = `SELECT COUNT(*)::int AS count FROM orders ${whereClause}`;
+    const countQuery = `SELECT COUNT(*)::int AS count FROM orders ${whereClause}`;
     const totalArr = await sql.unsafe(countQuery, params);
     const total = totalArr[0]?.count || 0;
 
     // Get paginated orders
-    let ordersQuery = `SELECT * FROM orders ${whereClause} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    const ordersQuery = `SELECT * FROM orders ${whereClause} 
+                         ORDER BY created_at DESC 
+                         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     const ordersResult = await sql.unsafe(ordersQuery, [...params, limit, offset]);
     const orders = Array.isArray(ordersResult) ? ordersResult : (ordersResult?.rows || []);
 
+    // Enrich with shipping + items
     const enrichedOrders = await Promise.all((orders || []).map(async (order) => {
       const shipping = (await sql`SELECT * FROM shipping_addresses WHERE order_id = ${order.id}`)[0];
-      const items = await sql`SELECT *, (SELECT row_to_json(p) FROM products p WHERE p.id = order_items.product_id) as product FROM order_items WHERE order_id = ${order.id}`;
+      const items = await sql`
+        SELECT *, (
+          SELECT row_to_json(p) 
+          FROM products p 
+          WHERE p.id = order_items.product_id
+        ) as product 
+        FROM order_items 
+        WHERE order_id = ${order.id}`;
       return { ...order, shipping, items };
     }));
 
@@ -454,9 +470,11 @@ app.get('/orders', authenticateToken, async (req, res) => {
       totalPages: Math.ceil(total / limit)
     });
   } catch (err) {
+    console.error("Error fetching orders:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // GET ORDER BY ID
 app.get('/orders/:id', authenticateToken, async (req, res) => {

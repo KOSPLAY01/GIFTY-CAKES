@@ -942,13 +942,13 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
 
 
 
-// RAW body parser required for signature check
+// ✅ FIXED PAYSTACK WEBHOOK
 app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const signature = req.headers['x-paystack-signature'];
     if (!signature) return res.status(400).send('Missing signature');
 
-    const rawBody = req.body; // Buffer
+    const rawBody = req.body;
     const hash = crypto
       .createHmac('sha512', process.env.PAYSTACK_SECRET)
       .update(rawBody)
@@ -969,57 +969,64 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
       const metadata = data.metadata;
       const user_id = metadata.user_id;
 
-      // Check if order already exists
+     
       const existing = await sql`SELECT * FROM orders WHERE payment_intent_id = ${ref}`;
       if (existing.length) {
         console.log('Order already exists for reference:', ref);
         return res.sendStatus(200);
       }
 
-      // Fetch cart
+      
       const cart = await getOrCreateCart(user_id);
       const cartItems = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
       const subtotal = cartItems.reduce((sum, i) => sum + Number(i.price), 0);
       const delivery_fee = metadata.delivery_fee || 0;
       const total = subtotal + delivery_fee;
 
-      // Insert order
+      
       const [order] = await sql`
-        INSERT INTO orders (user_id, items, subtotal, delivery_fee, grand_total, status, payment_method, payment_intent_id, delivery_address)
+        INSERT INTO orders (user_id, total, delivery_fee, delivery_date, delivery_time, payment_method, payment_intent_id, status)
         VALUES (
           ${user_id},
-          ${JSON.stringify(cartItems)},
-          ${subtotal},
-          ${delivery_fee},
           ${total},
-          'paid',
+          ${delivery_fee},
+          ${metadata.delivery_date},
+          ${metadata.delivery_time},
           'paystack',
           ${ref},
-          ${metadata.address}
+          'paid'
         )
         RETURNING id
       `;
 
-      // Move cart items → order_items
+      
       for (const item of cartItems) {
         await sql`
-          INSERT INTO order_items (order_id, product_id, quantity)
-          VALUES (${order.id}, ${item.product_id}, ${item.quantity})
+          INSERT INTO order_items (order_id, product_id, quantity, price, custom_description, custom_message)
+          VALUES (
+            ${order.id},
+            ${item.product_id},
+            ${item.quantity},
+            ${item.price},
+            ${item.custom_description || null},
+            ${item.custom_message || null}
+          )
         `;
       }
 
-      // Clear cart
+      // ✅ Clear cart
       await sql`DELETE FROM cart_items WHERE cart_id = ${cart.id}`;
 
       console.log(`🎉 Order ${order.id} created for user ${user_id}`);
     }
 
-    res.sendStatus(200); // Always ack Paystack
+    res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err.message);
     res.sendStatus(500);
   }
 });
+
 
 
 app.listen(PORT, () => {

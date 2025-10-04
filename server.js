@@ -564,67 +564,64 @@ app.get("/users", authenticateToken, async (req, res) => {
   }
 });
 
-// GET ALL ORDERS (ADMIN)
+// --- GET ALL ORDERS (ADMIN) ---
 app.get("/admin/orders", authenticateToken, async (req, res) => {
   if (req.user.role !== "admin") {
     return res.status(403).json({ error: "Only admins can view orders" });
   }
 
   try {
-    const { filter = "pending", page = 1, limit = 20 } = req.query;
+    const { filter, page = 1, limit = 20 } = req.query;
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
     const offset = (pageNum - 1) * limitNum;
 
-    // Validate status filter
-    if (!["pending", "paid", "completed"].includes(filter)) {
-      return res
-        .status(400)
-        .json({
-          error:
-            'Invalid filter. Only "pending", "paid", or "completed" allowed.',
-        });
+    // Build dynamic queries depending on filter
+    let countQuery, countParams, ordersQuery, orderParams;
+
+    if (filter && ["pending", "paid", "completed"].includes(filter)) {
+      // Filter by specific status
+      countQuery = `SELECT COUNT(*)::int AS count FROM orders WHERE status = $1`;
+      countParams = [filter];
+      ordersQuery = `
+        SELECT * FROM orders
+        WHERE status = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+      `;
+      orderParams = [filter, limitNum, offset];
+    } else {
+      // No filter → show all orders
+      countQuery = `SELECT COUNT(*)::int AS count FROM orders`;
+      countParams = [];
+      ordersQuery = `
+        SELECT * FROM orders
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+      `;
+      orderParams = [limitNum, offset];
     }
 
-    // Count query
-    const countQuery = `SELECT COUNT(*)::int AS count FROM orders WHERE status = $1`;
-    const countResult = await sql.query(countQuery, [filter]);
+    // Run count + data queries
+    const countResult = await sql.query(countQuery, countParams);
     const total = countResult[0]?.count || 0;
 
-    // Paginated orders query
-    const ordersQuery = `
-      SELECT * FROM orders
-      WHERE status = $1
-      ORDER BY created_at DESC
-      LIMIT $2 OFFSET $3
-    `;
-    const orderResults = await sql.query(ordersQuery, [
-      filter,
-      limitNum,
-      offset,
-    ]);
+    const orderResults = await sql.query(ordersQuery, orderParams);
 
-    // If not array, something went wrong
-    if (!Array.isArray(orderResults)) {
-      return res
-        .status(500)
-        .json({ error: "Unexpected result format from order query" });
-    }
-
-    // Enrich orders
+    // Enrich each order with shipping + items
     const enrichedOrders = await Promise.all(
       orderResults.map(async (order) => {
         const shippingRes =
           await sql`SELECT * FROM shipping_addresses WHERE order_id = ${order.id}`;
         const itemsRes = await sql`
-        SELECT oi.*, (
-          SELECT row_to_json(p)
-          FROM products p
-          WHERE p.id = oi.product_id
-        ) AS product
-        FROM order_items oi
-        WHERE oi.order_id = ${order.id}
-      `;
+          SELECT oi.*, (
+            SELECT row_to_json(p)
+            FROM products p
+            WHERE p.id = oi.product_id
+          ) AS product
+          FROM order_items oi
+          WHERE oi.order_id = ${order.id}
+        `;
         return {
           ...order,
           shipping: shippingRes[0] || null,
@@ -645,6 +642,7 @@ app.get("/admin/orders", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // GET ALL PRODUCTS (Admin)
 app.get("/admin/products", authenticateToken, async (req, res) => {

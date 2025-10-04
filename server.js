@@ -879,22 +879,26 @@ app.delete('/cart/:id', authenticateToken, async (req, res) => {
 // PAYMENT MANAGEMENT
 // PAYMENT INITIATION (Paystack)
 app.post('/payments/initiate', authenticateToken, async (req, res) => {
-  try {
-    const { email, delivery_date, delivery_time, address, phone, first_name, last_name, city } = req.body;
+  const { email, delivery_date, delivery_time, first_name, last_name, phone, address, city } = req.body;
 
+  try {
+    // get user cart
     const cart = await getOrCreateCart(req.user.id);
     const items = await sql`SELECT * FROM cart_items WHERE cart_id = ${cart.id}`;
     if (!items.length) return res.status(400).json({ error: 'Cart is empty' });
 
+    // calculate totals
     const subtotal = items.reduce((sum, i) => sum + Number(i.price), 0);
-    const delivery_fee = 1000; // Example flat fee (customize if needed)
+    const delivery_fee = 1000; // flat fee
     const total = subtotal + delivery_fee;
 
+    // initialize Paystack transaction
     const response = await axios.post(
       'https://api.paystack.co/transaction/initialize',
       {
         email,
-        amount: total * 100, // Paystack expects kobo
+        amount: total * 100, // kobo
+        currency: "NGN",
         metadata: {
           user_id: req.user.id,
           delivery_fee,
@@ -905,7 +909,7 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
           first_name,
           last_name,
           city,
-          cart: items
+          cart: items // include cart items for reference
         }
       },
       {
@@ -916,12 +920,16 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
       }
     );
 
-    res.json(response.data.data); // contains authorization_url + reference
+    res.json(response.data.data); // contains authorization_url, reference
   } catch (err) {
-    console.error('Paystack Init Error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to initiate Paystack payment' });
+    console.error("Paystack initiation error:", err.response?.data || err.message);
+    res.status(500).json({
+      error: 'Failed to initiate Paystack payment',
+      details: err.response?.data || err.message
+    });
   }
 });
+
 
 
 // RAW body parser required for signature check

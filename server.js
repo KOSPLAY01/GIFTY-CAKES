@@ -10,6 +10,8 @@ import nodemailer from "nodemailer";
 import { neon } from "@neondatabase/serverless";
 import axios from "axios";
 import crypto from "crypto";
+import http from "http";
+import { Server as SocketIOServer } from "socket.io";
 
 dotenv.config();
 
@@ -28,6 +30,35 @@ app.use(cors());
 const sql = neon(process.env.DATABASE_URL);
 
 const PORT = process.env.PORT || 3000;
+
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || "*",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true,
+  },
+});
+
+io.on("connection", (socket) => {
+  const auth = socket.handshake.auth || socket.handshake.query || {};
+  let userId = null;
+  if (auth.token) {
+    try {
+      const decoded = jwt.verify(auth.token, process.env.JWT_SECRET);
+      userId = decoded.id || decoded.user_id || null;
+    } catch (e) {}
+  }
+  if (!userId && auth.userId) {
+    const parsed = parseInt(auth.userId, 10);
+    userId = Number.isNaN(parsed) ? null : parsed;
+  }
+  if (userId) {
+    socket.join(`user:${userId}`);
+  }
+});
+
+app.set("io", io);
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -341,6 +372,8 @@ app.post("/product/cake", authenticateToken, async (req, res) => {
     `;
     const cartItem = inserted[0];
     const grand_total = await updateGrandTotal(req.user.id);
+    const _io = req.app.get("io");
+    if (_io) _io.to(`user:${req.user.id}`).emit("cart:updated", { grand_total });
     res.status(201).json({ ...cartItem, grand_total });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -429,6 +462,12 @@ app.post("/checkout/confirm", authenticateToken, async (req, res) => {
         FROM order_items WHERE order_id = ${order.id}
       `;
 
+      const _io = req.app.get("io");
+      if (_io) {
+        _io.to(`user:${req.user.id}`).emit("order:created", { orderId: order.id, status: order.status });
+        _io.to(`user:${req.user.id}`).emit("cart:updated", { grand_total: 0 });
+      }
+
       res.status(201).json({
         message: "Order placed successfully",
         order: {
@@ -455,9 +494,6 @@ app.get("/orders", authenticateToken, async (req, res) => {
     const limitNum = parseInt(limit);
     const offset = (pageNum - 1) * limitNum;
 
-    const userId = parseInt(req.user.user_id || req.user.id, 10);
-    if (!userId) return res.status(401).json({ error: "User not found in token" });
-
     // --- Count total orders ---
     const countQuery = `
       SELECT COUNT(*)::int AS count
@@ -466,8 +502,8 @@ app.get("/orders", authenticateToken, async (req, res) => {
       ${filter && ["pending", "paid", "completed"].includes(filter) ? "AND status = $2" : ""}
     `;
     const countParams = filter && ["pending", "paid", "completed"].includes(filter)
-      ? [userId, filter]
-      : [userId];
+      ? [req.user.id, filter]
+      : [req.user.id];
     const totalResult = await sql.query(countQuery, countParams);
     const total = totalResult[0]?.count || 0;
 
@@ -493,8 +529,8 @@ app.get("/orders", authenticateToken, async (req, res) => {
       LIMIT $${filter ? 3 : 2} OFFSET $${filter ? 4 : 3}
     `;
     const ordersParams = filter && ["pending", "paid", "completed"].includes(filter)
-      ? [userId, filter, limitNum, offset]
-      : [userId, limitNum, offset];
+      ? [req.user.id, filter, limitNum, offset]
+      : [req.user.id, limitNum, offset];
     const ordersResult = await sql.query(ordersQuery, ordersParams);
 
     // --- Add order items to each ---
@@ -525,7 +561,6 @@ app.get("/orders", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // GET ORDER BY ID
 app.get("/orders/:id", authenticateToken, async (req, res) => {
@@ -649,8 +684,6 @@ app.get("/admin/orders", authenticateToken, async (req, res) => {
   }
 });
 
-
-
 // GET ALL PRODUCTS (Admin)
 app.get("/admin/products", authenticateToken, async (req, res) => {
   if (req.user.role !== "admin")
@@ -691,9 +724,12 @@ app.put("/admin/orders/:id/status", authenticateToken, async (req, res) => {
   if (!status) return res.status(400).json({ error: "Status is required" });
 
   try {
-    const updated =
-      await sql`UPDATE orders SET status = ${status} WHERE id = ${id} RETURNING *`;
-    if (!updated[0]) return res.status(404).json({ error: "Order not found" });
+    const existing = await sql`SELECT * FROM orders WHERE id = ${id}`;
+    const order = existing[0];
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const updated = await sql`UPDATE orders SET status = ${status} WHERE id = ${id} RETURNING *`;
+    const _io = req.app.get("io");
+    if (_io) _io.to(`user:${order.user_id}`).emit("order:updated", { orderId: order.id, status });
     res.json(updated[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -892,6 +928,8 @@ app.post("/cart", authenticateToken, async (req, res) => {
     `;
     const cartItem = inserted[0];
     const grand_total = await updateGrandTotal(req.user.id);
+    const _io = req.app.get("io");
+    if (_io) _io.to(`user:${req.user.id}`).emit("cart:updated", { grand_total });
     res.status(201).json({ ...cartItem, grand_total });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -941,6 +979,8 @@ app.put("/cart/:id", authenticateToken, async (req, res) => {
     const updated =
       await sql`UPDATE cart_items SET quantity = ${quantity}, price = ${new_price} WHERE id = ${id} RETURNING *`;
     const grand_total = await updateGrandTotal(req.user.id);
+    const _io = req.app.get("io");
+    if (_io) _io.to(`user:${req.user.id}`).emit("cart:updated", { grand_total });
     res.json({ ...updated[0], grand_total });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -957,6 +997,8 @@ app.delete("/cart/:id", authenticateToken, async (req, res) => {
     if (!deleted[0])
       return res.status(404).json({ error: "Cart item not found" });
     const grand_total = await updateGrandTotal(req.user.id);
+    const _io = req.app.get("io");
+    if (_io) _io.to(`user:${req.user.id}`).emit("cart:updated", { grand_total });
     res.json({ message: "Deleted", grand_total });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1170,6 +1212,12 @@ app.post(
         console.log(
           `🎉 Order ${order.id} created for user ${user_id} with total ₦${total}`
         );
+
+        const _io = req.app.get("io");
+        if (_io) {
+          _io.to(`user:${user_id}`).emit("order:created", { orderId: order.id, status: "paid" });
+          _io.to(`user:${user_id}`).emit("cart:updated", { grand_total: 0 });
+        }
       }
 
       res.sendStatus(200);
@@ -1181,6 +1229,6 @@ app.post(
 );
 
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
